@@ -1,8 +1,11 @@
 import docker
 import time
 from typing import Dict, Generator, Union
+from unittest.mock import MagicMock, patch
+
 import pytest
 from docker.models.containers import Container
+from sqlalchemy import text
 from llama_index.core.llms import ChatMessage
 from llama_index.core.storage.chat_store.base import BaseChatStore
 from llama_index.storage.chat_store.yugabytedb import YugabyteDBChatStore
@@ -163,3 +166,119 @@ def test_delete_last_message(yugabytedb_chat_store: YugabyteDBChatStore):
 
     assert len(remaining_messages) == 1
     assert remaining_messages[0].content == "First message"
+
+
+class _RecordingSession:
+    def __init__(self, messages: list) -> None:
+        self.messages = messages
+        self.statements: list[str] = []
+
+    def __enter__(self) -> "_RecordingSession":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def execute(self, stmt: object, params: object = None) -> MagicMock:
+        sql = stmt.text if hasattr(stmt, "text") else str(stmt)
+        self.statements.append(sql)
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = self.messages
+        return result
+
+    def commit(self) -> None:
+        return None
+
+
+def _store_with_recording_session(schema_name: str = "tenant_a") -> tuple:
+    messages = [
+        {"role": "user", "content": "one"},
+        {"role": "user", "content": "two"},
+        {"role": "user", "content": "three"},
+    ]
+    session = _RecordingSession(messages)
+    with patch.object(YugabyteDBChatStore, "_initialize"):
+        store = YugabyteDBChatStore(
+            session=lambda: session,
+            table_name="chatstore",
+            schema_name=schema_name,
+        )
+    return store, session
+
+
+def test_delete_sql_is_schema_qualified():
+    """delete_message / delete_last_message must UPDATE schema_name.table, not search_path."""
+    store, session = _store_with_recording_session("tenant_a")
+    table = store._table_class.__tablename__
+    qualified = f"UPDATE tenant_a.{table}"
+
+    session.statements.clear()
+    store.delete_last_message("user1")
+    assert any(qualified in sql for sql in session.statements)
+
+    session.statements.clear()
+    store.delete_message("user1", 0)
+    assert any(qualified in sql for sql in session.statements)
+
+
+def test_delete_message_and_delete_last_message_honor_schema(
+    yugabytedb_container: Dict[str, Union[str, Container]],
+):
+    """Deletes must rewrite only schema_name.table, not a same-named table in public."""
+    table_name = "chatstore_schema_isolation"
+    key = "user1"
+    shared = YugabyteDBChatStore.from_uri(
+        uri=yugabytedb_container["connection_string"],
+        table_name=table_name,
+        use_jsonb=True,
+    )
+    tenant = YugabyteDBChatStore.from_uri(
+        uri=yugabytedb_container["connection_string"],
+        table_name=table_name,
+        schema_name="tenant_a",
+        use_jsonb=True,
+    )
+    messages = [
+        ChatMessage(role="user", content="one"),
+        ChatMessage(role="user", content="two"),
+        ChatMessage(role="user", content="three"),
+    ]
+    try:
+        shared.set_messages(key, messages)
+        tenant.set_messages(key, messages)
+
+        deleted_last = tenant.delete_last_message(key)
+        assert deleted_last is not None
+        assert deleted_last.content == "three"
+        assert [m.content for m in tenant.get_messages(key)] == ["one", "two"]
+        assert [m.content for m in shared.get_messages(key)] == [
+            "one",
+            "two",
+            "three",
+        ]
+
+        deleted_first = tenant.delete_message(key, 0)
+        assert deleted_first is not None
+        assert deleted_first.content == "one"
+        assert [m.content for m in tenant.get_messages(key)] == ["two"]
+        assert [m.content for m in shared.get_messages(key)] == [
+            "one",
+            "two",
+            "three",
+        ]
+    finally:
+        shared.delete_messages(key)
+        tenant.delete_messages(key)
+        with tenant._session() as session, session.begin():
+            session.execute(
+                text(
+                    f'DROP TABLE IF EXISTS "{tenant.schema_name}"."{tenant._table_class.__tablename__}" CASCADE'
+                )
+            )
+            session.execute(text('DROP SCHEMA IF EXISTS "tenant_a" CASCADE'))
+        with shared._session() as session, session.begin():
+            session.execute(
+                text(
+                    f'DROP TABLE IF EXISTS "{shared.schema_name}"."{shared._table_class.__tablename__}" CASCADE'
+                )
+            )

@@ -392,3 +392,112 @@ def test_empty_table_name_defaults_to_chatstore(
                     f'DROP TABLE IF EXISTS "{chat_store.schema_name}"."{default_table_name}" CASCADE'
                 )
             )
+
+
+def _seed_messages(store: PostgresChatStore, key: str) -> None:
+    store.delete_messages(key)
+    store.set_messages(
+        key,
+        [
+            ChatMessage(role="user", content="one"),
+            ChatMessage(role="user", content="two"),
+            ChatMessage(role="user", content="three"),
+        ],
+    )
+
+
+def _message_contents(store: PostgresChatStore, key: str) -> list[str]:
+    return [message.content for message in store.get_messages(key)]
+
+
+def _drop_store_table(store: PostgresChatStore) -> None:
+    table_name = store._table_class.__tablename__
+    schema_name = store.schema_name
+    with store._session() as session, session.begin():
+        session.execute(
+            text(f'DROP TABLE IF EXISTS "{schema_name}"."{table_name}" CASCADE')
+        )
+
+
+@pytest.mark.skipif(no_packages, reason="asyncpg, psycopg and sqlalchemy not installed")
+def test_delete_message_and_delete_last_message_honor_schema(
+    postgres_container: Dict[str, Union[str, Container]],
+):
+    """Deletes must rewrite only schema_name.table, not a same-named table in public."""
+    table_name = "chatstore_schema_isolation"
+    key = "user1"
+    shared = PostgresChatStore.from_uri(
+        uri=postgres_container["connection_string"],
+        table_name=table_name,
+        use_jsonb=True,
+    )
+    tenant = PostgresChatStore.from_uri(
+        uri=postgres_container["connection_string"],
+        table_name=table_name,
+        schema_name="tenant_a",
+        use_jsonb=True,
+    )
+    try:
+        _seed_messages(shared, key)
+        _seed_messages(tenant, key)
+
+        deleted_last = tenant.delete_last_message(key)
+        assert deleted_last is not None
+        assert deleted_last.content == "three"
+        assert _message_contents(tenant, key) == ["one", "two"]
+        assert _message_contents(shared, key) == ["one", "two", "three"]
+
+        deleted_first = tenant.delete_message(key, 0)
+        assert deleted_first is not None
+        assert deleted_first.content == "one"
+        assert _message_contents(tenant, key) == ["two"]
+        assert _message_contents(shared, key) == ["one", "two", "three"]
+    finally:
+        shared.delete_messages(key)
+        tenant.delete_messages(key)
+        _drop_store_table(tenant)
+        _drop_store_table(shared)
+        with tenant._session() as session, session.begin():
+            session.execute(text('DROP SCHEMA IF EXISTS "tenant_a" CASCADE'))
+
+
+@pytest.mark.skipif(no_packages, reason="asyncpg, psycopg and sqlalchemy not installed")
+@pytest.mark.asyncio
+async def test_adelete_message_and_adelete_last_message_honor_schema(
+    postgres_container: Dict[str, Union[str, Container]],
+):
+    table_name = "chatstore_schema_isolation_async"
+    key = "user1"
+    shared = PostgresChatStore.from_uri(
+        uri=postgres_container["connection_string"],
+        table_name=table_name,
+        use_jsonb=True,
+    )
+    tenant = PostgresChatStore.from_uri(
+        uri=postgres_container["connection_string"],
+        table_name=table_name,
+        schema_name="tenant_a",
+        use_jsonb=True,
+    )
+    try:
+        _seed_messages(shared, key)
+        _seed_messages(tenant, key)
+
+        deleted_last = await tenant.adelete_last_message(key)
+        assert deleted_last is not None
+        assert deleted_last.content == "three"
+        assert _message_contents(tenant, key) == ["one", "two"]
+        assert _message_contents(shared, key) == ["one", "two", "three"]
+
+        deleted_first = await tenant.adelete_message(key, 0)
+        assert deleted_first is not None
+        assert deleted_first.content == "one"
+        assert _message_contents(tenant, key) == ["two"]
+        assert _message_contents(shared, key) == ["one", "two", "three"]
+    finally:
+        shared.delete_messages(key)
+        tenant.delete_messages(key)
+        _drop_store_table(tenant)
+        _drop_store_table(shared)
+        with tenant._session() as session, session.begin():
+            session.execute(text('DROP SCHEMA IF EXISTS "tenant_a" CASCADE'))
